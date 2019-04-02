@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog"
+	"k8s.io/klog/glog"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -306,10 +307,72 @@ func (r *ReconcileMachineSet) getCluster(ms *machinev1beta1.MachineSet) (*machin
 	return cluster, nil
 }
 
+func (r *ReconcileMachineSet) resyncExistingReplicas(ms *machinev1beta1.MachineSet, machines []*machinev1beta1.Machine) error {
+	var errstrings []string
+
+	// Sync new labels and taints additivelly
+	for i := range machines {
+		fmt.Printf("ms.Spec.Template.Spec.Labels: %v\n", ms.Spec.Template.Spec.Labels)
+		fmt.Printf("machines[%v].Spec.Labels: %v\n", i, machines[i].Spec.Labels)
+
+		if machines[i].Spec.Labels == nil {
+			machines[i].Spec.Labels = make(map[string]string)
+		}
+
+		if machines[i].Spec.Taints == nil {
+			machines[i].Spec.Taints = make([]corev1.Taint, 0)
+		}
+
+		modified := false
+		for key, value := range ms.Spec.Template.Spec.Labels {
+			if _, exists := machines[i].Spec.Labels[key]; exists {
+				continue
+			}
+			// Only add new labels
+			machines[i].Spec.Labels[key] = value
+			modified = true
+		}
+
+		for i, taint := range ms.Spec.Template.Spec.Taints {
+			klog.V(3).Infof("Adding taint %v from machineset %q to machine %q", taint, ms.Name, machines[i].Name)
+			alreadyPresent := false
+			for _, machineTaint := range machines[i].Spec.Taints {
+				if taint.Key == machineTaint.Key && taint.Effect == machineTaint.Effect {
+					glog.V(3).Infof("Skipping to add machineset taint, %v, to the machine. Machine already has a taint with the same key and effect", machineTaint)
+					alreadyPresent = true
+					break
+				}
+			}
+			if !alreadyPresent {
+				machines[i].Spec.Taints = append(machines[i].Spec.Taints, taint)
+			}
+			modified = true
+		}
+
+		if modified {
+			// TODO(jchaloup): use Patch operation once implemented in the controller-runtime
+			if err := r.Client.Update(context.Background(), machines[i]); err != nil {
+				errstrings = append(errstrings, err.Error())
+				klog.Errorf("Unable to add labels to machine %q: %v", machines[i].Name, err)
+			}
+		}
+	}
+
+	if len(errstrings) > 0 {
+		return errors.New(strings.Join(errstrings, "; "))
+	}
+
+	return nil
+}
+
 // syncReplicas essentially scales machine resources up and down.
 func (r *ReconcileMachineSet) syncReplicas(ms *machinev1beta1.MachineSet, machines []*machinev1beta1.Machine) error {
 	if ms.Spec.Replicas == nil {
 		return errors.Errorf("the Replicas field in Spec for machineset %v is nil, this should not be allowed", ms.Name)
+	}
+
+	if err := r.resyncExistingReplicas(ms, machines); err != nil {
+		return errors.Errorf("error resyncing existing replicas: %v", err)
 	}
 
 	diff := len(machines) - int(*(ms.Spec.Replicas))
